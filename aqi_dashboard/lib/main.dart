@@ -1,4 +1,10 @@
+import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:geocoding/geocoding.dart';
+import 'package:flutter/foundation.dart';
+import 'package:http/http.dart' as http;
 
 void main() {
   runApp(const MyApp());
@@ -64,7 +70,141 @@ class AqiDashboard extends StatefulWidget {
 }
 
 class _AqiDashboardState extends State<AqiDashboard> {
-  final AqiData myLocation = AqiData(location: "Surakarta", pm25: 120);
+  AqiData myLocation = AqiData(location: "Mencari lokasi...", pm25: 0);
+  StreamSubscription<Position>? _positionStream;
+  bool _isLoading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _initLocationService();
+  }
+
+  @override
+  void dispose() {
+    _positionStream?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _initLocationService() async {
+    bool serviceEnabled;
+    LocationPermission permission;
+
+    serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    if (!serviceEnabled) {
+      setState(() {
+        myLocation = AqiData(location: "GPS tidak aktif", pm25: 0);
+        _isLoading = false;
+      });
+      return;
+    }
+
+    permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) {
+      permission = await Geolocator.requestPermission();
+      if (permission == LocationPermission.denied) {
+        setState(() {
+          myLocation = AqiData(location: "Izin lokasi ditolak", pm25: 0);
+          _isLoading = false;
+        });
+        return;
+      }
+    }
+
+    if (permission == LocationPermission.deniedForever) {
+      setState(() {
+        myLocation = AqiData(location: "Izin lokasi ditolak permanen", pm25: 0);
+        _isLoading = false;
+      });
+      return;
+    }
+
+    // Get current position initially
+    try {
+      final position = await Geolocator.getCurrentPosition();
+      await _updateLocation(position);
+    } catch (e) {
+      debugPrint("Error getting initial position: $e");
+    }
+
+    // Listen for real-time updates
+    _positionStream = Geolocator.getPositionStream(
+      locationSettings: const LocationSettings(
+        accuracy: LocationAccuracy.high,
+        distanceFilter: 10,
+      ),
+    ).listen((Position position) {
+      _updateLocation(position);
+    });
+  }
+
+  Future<void> _updateLocation(Position position) async {
+    final lat = position.latitude;
+    final lon = position.longitude;
+    final fallback = "Lat: ${lat.toStringAsFixed(4)}, Lon: ${lon.toStringAsFixed(4)}";
+    String cityName = fallback;
+
+    if (kIsWeb) {
+      // Platform Web: gunakan Nominatim (OpenStreetMap)
+      try {
+        final url = Uri.parse(
+          "https://nominatim.openstreetmap.org/reverse?lat=$lat&lon=$lon&format=json",
+        );
+        final response = await http.get(
+          url,
+          headers: {"Accept-Language": "id", "User-Agent": "AeroSenseApp/1.0"},
+        ).timeout(const Duration(seconds: 10));
+
+        if (response.statusCode == 200) {
+          final data = jsonDecode(response.body);
+          final address = data['address'];
+          debugPrint("Nominatim address: $address");
+
+          final parts = [
+            address['suburb'],
+            address['city'] ?? address['town'] ?? address['village'],
+            address['state'],
+          ].where((s) => s != null && s.toString().trim().isNotEmpty).toList();
+
+          if (parts.isNotEmpty) {
+            cityName = parts.join(', ');
+          }
+        }
+      } catch (e) {
+        debugPrint("Nominatim error: $e");
+        cityName = fallback;
+      }
+    } else {
+      // Platform Native (Android/iOS): gunakan package geocoding
+      try {
+        final placemarks = await placemarkFromCoordinates(lat, lon)
+            .timeout(const Duration(seconds: 10));
+
+        if (placemarks.isNotEmpty) {
+          final p = placemarks.first;
+          debugPrint("Placemark: subLocality=${p.subLocality}, locality=${p.locality}, adminArea=${p.administrativeArea}");
+
+          final parts = [
+            p.subLocality,
+            p.locality,
+            p.administrativeArea,
+          ].where((s) => s != null && s.trim().isNotEmpty).toList();
+
+          if (parts.isNotEmpty) {
+            cityName = parts.join(', ');
+          }
+        }
+      } catch (e) {
+        debugPrint("Geocoding error: $e");
+        cityName = fallback;
+      }
+    }
+
+    setState(() {
+      myLocation = AqiData(location: cityName, pm25: 42);
+      _isLoading = false;
+    });
+  }
 
   String get lastUpdated {
     final now = DateTime.now();
@@ -268,14 +408,33 @@ class _AqiDashboardState extends State<AqiDashboard> {
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
-                              Text(
-                                myLocation.location,
-                                style: const TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 24,
-                                  fontWeight: FontWeight.bold,
+                              if (_isLoading)
+                                const Row(
+                                  children: [
+                                    SizedBox(
+                                      height: 20,
+                                      width: 20,
+                                      child: CircularProgressIndicator(
+                                        color: Colors.white,
+                                        strokeWidth: 2,
+                                      ),
+                                    ),
+                                    SizedBox(width: 12),
+                                    Text(
+                                      "Mendapatkan lokasi...",
+                                      style: TextStyle(color: Colors.white, fontSize: 16),
+                                    )
+                                  ],
+                                )
+                              else
+                                Text(
+                                  myLocation.location,
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 24,
+                                    fontWeight: FontWeight.bold,
+                                  ),
                                 ),
-                              ),
                               const SizedBox(height: 4),
                               Row(
                                 children: [
@@ -409,60 +568,74 @@ class _AqiDashboardState extends State<AqiDashboard> {
                         child: Padding(
                           padding: const EdgeInsets.symmetric(horizontal: 20.0, vertical: 8.0),
                           child: Container(
+                            padding: const EdgeInsets.all(18),
                             decoration: BoxDecoration(
                               color: Colors.white,
-                              borderRadius: BorderRadius.circular(20),
+                              borderRadius: BorderRadius.circular(24),
                               boxShadow: [
                                 BoxShadow(
                                   color: Colors.black.withOpacity(0.03),
-                                  blurRadius: 10,
+                                  blurRadius: 15,
                                   offset: const Offset(0, 5),
                                 )
                               ],
                             ),
-                            child: ListTile(
-                              contentPadding: const EdgeInsets.all(16),
-                              leading: Container(
-                                width: 55,
-                                height: 55,
-                                decoration: BoxDecoration(
-                                  gradient: LinearGradient(
-                                    colors: [data.getPrimaryColor(), data.getSecondaryColor()],
-                                    begin: Alignment.topLeft,
-                                    end: Alignment.bottomRight,
+                            child: Row(
+                              children: [
+                                Container(
+                                  padding: const EdgeInsets.all(12),
+                                  decoration: BoxDecoration(
+                                    color: data.getPrimaryColor().withOpacity(0.1),
+                                    shape: BoxShape.circle,
                                   ),
-                                  borderRadius: BorderRadius.circular(15),
+                                  child: Icon(data.getIcon(), color: data.getPrimaryColor(), size: 28),
                                 ),
-                                child: Center(
-                                  child: Text(
-                                    data.pm25.toString(),
-                                    style: const TextStyle(
-                                      color: Colors.white,
-                                      fontWeight: FontWeight.bold,
-                                      fontSize: 18,
+                                const SizedBox(width: 16),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        data.location,
+                                        style: const TextStyle(
+                                          fontSize: 16,
+                                          fontWeight: FontWeight.bold,
+                                          color: Color(0xFF2D3142),
+                                        ),
+                                      ),
+                                      Text(
+                                        data.getStatus(),
+                                        style: TextStyle(
+                                          fontSize: 13,
+                                          color: Colors.blueGrey.shade400,
+                                          fontWeight: FontWeight.w500,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                Column(
+                                  crossAxisAlignment: CrossAxisAlignment.end,
+                                  children: [
+                                    Text(
+                                      data.pm25.toString(),
+                                      style: TextStyle(
+                                        fontSize: 24,
+                                        fontWeight: FontWeight.w900,
+                                        color: data.getPrimaryColor(),
+                                      ),
                                     ),
-                                  ),
+                                    const Text(
+                                      "PM 2.5",
+                                      style: TextStyle(
+                                        fontSize: 10,
+                                        fontWeight: FontWeight.bold,
+                                        color: Colors.blueGrey,
+                                      ),
+                                    ),
+                                  ],
                                 ),
-                              ),
-                              title: Text(
-                                data.location,
-                                style: const TextStyle(
-                                  fontWeight: FontWeight.bold,
-                                  fontSize: 16,
-                                  color: Color(0xFF2D3142),
-                                ),
-                              ),
-                              subtitle: Padding(
-                                padding: const EdgeInsets.only(top: 4.0),
-                                child: Text(
-                                  data.getStatus(),
-                                  style: TextStyle(
-                                    color: Colors.grey.shade600,
-                                    fontWeight: FontWeight.w500,
-                                  ),
-                                ),
-                              ),
-                              trailing: Icon(data.getIcon(), color: data.getPrimaryColor(), size: 30),
+                              ],
                             ),
                           ),
                         ),
@@ -471,8 +644,7 @@ class _AqiDashboardState extends State<AqiDashboard> {
                     childCount: savedCities.length,
                   ),
                 ),
-
-                const SliverToBoxAdapter(child: SizedBox(height: 40)),
+                const SliverToBoxAdapter(child: SizedBox(height: 30)),
               ],
             ),
           ),
